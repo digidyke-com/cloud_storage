@@ -47,13 +47,8 @@ class CloudStorageFile(File):
 		return not self.content
 
 	def validate(self) -> None:
-		"""
-		HASH: 69a495579a729909f4df7a45855165eee4a208f4
-		REPO: https://github.com/frappe/frappe
-		PATH: frappe/core/doctype/file/file.py
-		METHOD: validate
-		"""
-		self.associate_files()
+		# Dedup/association disabled: do not auto-associate on save (this was the
+		# source of the infinite-recursion 500 between duplicate-hash rows).
 		if self.flags.cloud_storage or self.flags.ignore_file_validate:
 			return
 		if not self.is_remote_file:
@@ -99,76 +94,23 @@ class CloudStorageFile(File):
 			overwrite=True,
 		)
 
-	def after_insert(self) -> File:
-		"""
-		HASH: bfbebb3d3d9c26eb34ed447112fcd46f1dadff00
-		REPO: https://github.com/frappe/frappe
-		PATH: frappe/core/doctype/file/file.py
-		METHOD: after_insert
-		"""
-		if self.attached_to_doctype and self.attached_to_name and not self.file_association:  # type: ignore
-			if not self.content_hash and "/api/method/retrieve" in self.file_url:  # type: ignore
-				associated_doc = frappe.get_value("File", {"file_url": self.file_url}, "name")  # type: ignore
-			else:
-				associated_doc = frappe.get_value(
-					"File",
-					{"content_hash": self.content_hash, "name": ["!=", self.name], "is_folder": False},  # type: ignore
-				)
-			if associated_doc and associated_doc != self.name:
-				self.db_set(
-					"file_url", ""
-				)  # this is done to prevent deletion of the remote file with the delete_file hook
-				rename_doc(
-					self.doctype,
-					self.name,
-					associated_doc,
-					merge=True,
-					force=True,
-					show_alert=False,
-					ignore_permissions=True,
-					# validate=False,
-				)
-			if associated_doc and not self.s3_key:
-				s3_key = None
-				if "?key=" in self.file_url:
-					s3_key = self.file_url.split("?key=")[1]
-				elif "key=" in self.file_url:
-					s3_key = self.file_url.split("key=")[1].split("&")[0]
-				frappe.db.set_value("File", associated_doc, "s3_key", s3_key)
-				frappe.db.commit()
-		elif self.attached_to_doctype and self.attached_to_name and self.file_name:  # type: ignore
-			associated_doc = frappe.db.get_value(
-				"File",
-				{
-					"file_name": ["=", self.file_name],
-					"content_hash": self.content_hash,
-					"name": ["!=", self.name],
-					"is_folder": False,
-				},
-				"name",  # type: ignore
-			)
-			if associated_doc:
-				doc = frappe.get_doc("File", associated_doc)
-				# Merge file associations
-				doc.append(
-					"file_association",
-					add_child_file_association(
-						self.attached_to_doctype,  # type: ignore
-						self.attached_to_name,  # type: ignore
-					),
-				)
-				already_linked = any(version.version == self.content_hash for version in self.versions)
-				if not already_linked:
-					doc.append(
-						"versions",
-						{
-							"version": str(self.content_hash),
-							"user": frappe.session.user,
-							"timestamp": get_datetime(),
-						},
-					)
-				doc.save()
-				frappe.delete_doc("File", self.name, ignore_permissions=True)
+	def after_insert(self):
+		# Dedup/association/versioning disabled: keep core behaviour (timeline entry).
+		# The old content-hash merge here used rename_doc(merge=True), which wiped the
+		# surviving file's s3_key on re-upload and corrupted the stored object link.
+		return super().after_insert()
+
+	def create_attachment_record(self):
+		# Core quote()s file_url (safe="/:") which corrupts our ?key= link; use it as-is.
+		if self.is_folder or not (self.attached_to_doctype and self.attached_to_name):
+			return
+		from frappe.utils.html_utils import escape_html
+
+		icon = ' <i class="fa fa-lock text-warning"></i>' if self.is_private else ""
+		label = escape_html(self.file_name or self.file_url)
+		self.add_comment_in_reference_doc(
+			"Attachment", f"<a href='{self.file_url}' target='_blank'>{label}</a>{icon}"
+		)
 
 	def on_trash(self) -> None:
 		"""
@@ -547,21 +489,20 @@ def get_sharing_url(client, key: str) -> str:
 def upload_file(file: File) -> File:
 	client = get_cloud_storage_client()
 	path = get_file_path(file, client.folder)
-	file.db_set("file_url", FILE_URL.format(path=path))
+	# URL-encode the key in file_url (spaces etc.) so links don't get mangled;
+	# s3_key stays raw so retrieve()'s lookup still matches.
+	file.db_set("file_url", FILE_URL.format(path=quote(path)))
 	content_type = file.content_type or from_buffer(file.content, mime=True)
-	version_id = None
 	try:
-		response = client.put_object(
+		client.put_object(
 			Body=file.content, Bucket=client.bucket, Key=path, ContentType=content_type
 		)
-		version_id = response.get("VersionId") or file.content_hash
-		file.associate_files(file.attached_to_doctype, file.attached_to_name)
 	except S3UploadFailedError:
 		frappe.throw(_("File Upload Failed. Please try again."))
 	except Exception as e:
+		# Fail loudly: never leave a File record pointing at an object that wasn't uploaded.
 		frappe.log_error("File Upload Error", e)
-	if version_id:
-		file.add_file_version(version_id)
+		raise
 	file.db_set("s3_key", path)
 	return file
 
@@ -580,10 +521,11 @@ def get_file_path(file: File, folder: str | None = None) -> str:
 	if config.get("use_legacy_paths", True):
 		return _legacy_get_file_path(file, folder)
 
+	# content_hash keys make distinct files collision-proof (set before upload)
 	if folder:
-		return f"{folder}/{file.file_name}"
+		return f"{folder}/{file.content_hash}/{file.file_name}"
 
-	return file.file_name
+	return f"{file.content_hash}/{file.file_name}"
 
 
 def _legacy_get_file_path(file: File, folder: str | None = None) -> str:
@@ -597,6 +539,7 @@ def _legacy_get_file_path(file: File, folder: str | None = None) -> str:
 		folder,
 		parent_doctype,
 		attached_to_name,
+		file.content_hash,  # unique per distinct content -> collision-proof key
 		file.file_name.replace("#", "%23"),
 	]
 
@@ -615,9 +558,17 @@ def get_file_content_hash(content, content_type):
 
 @frappe.whitelist()
 def write_file(file: File, remove_spaces_in_file_name: bool = True) -> File:
-	if not frappe.conf.cloud_storage_settings or frappe.conf.cloud_storage_settings.get(
-		"use_local", False
-	):
+	config = frappe.conf.cloud_storage_settings
+	if not config or config.get("use_local", False):
+		# Never fail silently: if cloud is unconfigured, log it (and optionally refuse)
+		# instead of quietly writing to local disk. `use_local` is an intentional opt-out.
+		if not config:
+			frappe.log_error(
+				"cloud_storage_settings missing - file stored on LOCAL disk instead of object storage",
+				"Cloud Storage: local fallback",
+			)
+			if frappe.conf.get("require_cloud_storage"):
+				frappe.throw(_("Cloud storage is not configured; refusing to store file locally."))
 		file.save_file_on_filesystem()
 		return file
 
@@ -625,36 +576,7 @@ def write_file(file: File, remove_spaces_in_file_name: bool = True) -> File:
 		file.save_file_on_filesystem()
 		return file
 
-	# if a hash-conflict is found, update the existing document with a new file association
-	existing_file_hashes = frappe.get_all(
-		"File",
-		filters={"name": ["!=", file.name], "content_hash": file.content_hash},
-		pluck="name",
-	)
-
-	if existing_file_hashes:
-		file_doc: File = frappe.get_doc("File", existing_file_hashes[0])
-		file_doc.associate_files(file.attached_to_doctype, file.attached_to_name)
-		file_doc.save()
-		return file_doc
-
-	# if a filename-conflict is found, update the existing document with a new version instead
-	existing_file_names = frappe.get_all(
-		"File", filters={"name": ["!=", file.name], "file_name": file.file_name}, pluck="name"
-	)
-
-	if existing_file_names:
-		file_doc = frappe.get_doc("File", existing_file_names[0])
-		file_doc.update(
-			{
-				"content": file.content,
-				"content_hash": file.content_hash,
-				"content_type": file.content_type,
-			}
-		)
-		file_doc.associate_files(file.attached_to_doctype, file.attached_to_name)
-		file = file_doc
-
+	# Dedup/association/versioning disabled: every upload is an independent file.
 	if remove_spaces_in_file_name:
 		file.file_name = file.file_name.replace(" ", "_")
 
@@ -665,70 +587,19 @@ def write_file(file: File, remove_spaces_in_file_name: bool = True) -> File:
 
 @frappe.whitelist()
 def delete_file(file: File, **kwargs) -> File:
-	if not frappe.conf.cloud_storage_settings or frappe.conf.cloud_storage_settings.get(
-		"use_local", False
-	):
-		file.delete_file_from_filesystem()
-		return file
-
-	if file.is_folder:
-		return file
-
-	if file.file_url and "?key=" in file.file_url:
-		key = file.file_url.split("?key=")[1]
-		if key:
-			client = get_cloud_storage_client()
-			try:
-				client.delete_object(Bucket=client.bucket, Key=key)
-			except ClientError:
-				frappe.throw(_("Access denied: Could not delete file"))
-			except Exception as e:
-				print(f"EXCEPTION: {e}")
-				frappe.log_error(str(e), "Cloud Storage Error: Could not delete file")
-
+	# Retention: deleting a File in ERPNext removes the record but KEEPS the object in
+	# object storage (never delete from the bucket). Local-only files (Data Import /
+	# use_local) are still cleaned from disk.
+	is_cloud = bool(file.get("s3_key")) or (file.file_url or "").startswith("/api/method/retrieve")
+	if not is_cloud:
+		file.delete_file_from_filesystem(only_thumbnail=kwargs.get("only_thumbnail", False))
 	return file
 
 
 @frappe.whitelist()
 def validate_file_content(*args, **kwargs):
-	matched_files = []
-	files = frappe.request.files
-
-	if "file" in files:
-		file: FileStorage = files["file"]
-		content_type = guess_type(file.filename)[0]
-
-		# validate filename
-		file_name = file.filename
-		existing_files_by_name = frappe.get_all(
-			"File", filters={"file_name": file_name}, pluck="file_name"
-		)
-
-		# validate content hash
-		file.stream.seek(0)
-		content = file.stream.read()
-		content_hash = get_file_content_hash(content, content_type)
-
-		existing_files_by_hash = frappe.get_all(
-			"File", filters={"content_hash": content_hash}, pluck="file_name"
-		)
-
-		# if no files are found by name or hash, and if the file is an image, match against optimized content
-		if not existing_files_by_hash and content_type.startswith("image/"):
-			optimized_content = optimize_image(content, content_type)
-			optimized_content_hash = get_file_content_hash(optimized_content, content_type)
-			existing_files_by_hash = frappe.get_all(
-				"File", filters={"content_hash": optimized_content_hash}, pluck="file_name"
-			)
-
-		# build a list of matched files
-		matched_files = list(set(existing_files_by_name + existing_files_by_hash))
-
-	return {
-		"filename_exists": len(existing_files_by_name) > 0,
-		"content_exists": len(existing_files_by_hash) > 0,
-		"matched_files": matched_files,
-	}
+	# Dedup disabled: never flag files as already existing (no "already exists" prompt).
+	return {"filename_exists": False, "content_exists": False, "matched_files": []}
 
 
 @frappe.whitelist(allow_guest=True)

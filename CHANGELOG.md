@@ -3,6 +3,27 @@ For license information, please see license.txt-->
 
 # CHANGELOG
 
+## v16.1.0 (2026-09-16)
+
+Digidyke fork — hardened for ERPNext / Frappe v16 on DigitalOcean Spaces (S3-compatible object storage).
+
+### Changed
+
+- Disabled cross-document deduplication, File Association linking and file versioning. These were the source of an infinite-recursion 500 on duplicate-hash rows, `s3_key` corruption when re-uploading a same-content file, and false "file already exists" upload blocks. Every upload is now an independent object.
+- **Retention-only deletion:** deleting a File in ERPNext removes the record but keeps the object in object storage (never deletes from the bucket). Local-only files (Data Import / `use_local`) are still cleaned from local disk.
+- S3 object keys now include the file's `content_hash`, making distinct files collision-proof (same name + same document no longer overwrite each other).
+- `file_url` keys are URL-encoded (spaces etc.) so attachment links are not mangled by client-side URL handling; `s3_key` is stored raw so lookups still match.
+- Restored Frappe's native attachment lister (removed the File Association `get_attachments` monkey-patch) so uploaded files appear in the sidebar.
+
+### Added
+
+- Loud local-fallback logging plus an opt-in `require_cloud_storage` site-config flag that refuses to store files locally when object storage is not configured.
+
+### Fixed
+
+- Activity-timeline attachment links no longer corrupted by core's `quote()` — the `retrieve` URL now works from the activity log, not just the sidebar.
+- Uploads now fail loudly on an S3 error instead of silently creating a File record that points at a missing object.
+
 ## v15.7.2 (2024-08-20)
 
 ### Fix

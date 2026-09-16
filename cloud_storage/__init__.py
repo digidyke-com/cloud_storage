@@ -1,32 +1,8 @@
 # Copyright (c) 2024, AgriTheory and contributors
 # For license information, please see license.txt
 
-__version__ = "16.0.0"
+__version__ = "16.1.0"
 
-
-import frappe.desk.form.load
-from frappe.query_builder import DocType
-
-
-@frappe.whitelist()
-def patched_get_attachments(dt, dn):
-	if "cloud_storage" not in frappe.get_installed_apps():
-		return frappe.get_all(
-			"File",
-			fields=["name", "file_name", "file_url", "is_private"],
-			filters={"attached_to_name": dn, "attached_to_doctype": dt},
-		)
-
-	File = DocType("File")
-	FileAssociation = DocType("File Association")
-	return (
-		frappe.qb.from_(FileAssociation)
-		.inner_join(File)
-		.on(File.name == FileAssociation.parent)
-		.select(File.name, File.file_name, File.file_url, File.is_private)
-		.where(FileAssociation.link_doctype == dt)
-		.where(FileAssociation.link_name == dn)
-	).run(as_dict=True)
-
-
-frappe.desk.form.load.get_attachments = patched_get_attachments
+# NOTE: the previous get_attachments monkey-patch (listing via the File Association
+# table) was removed along with the association feature. Frappe's native
+# get_attachments — which lists by File.attached_to_doctype/name — is used instead.
