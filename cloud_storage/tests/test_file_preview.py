@@ -3,7 +3,7 @@
 
 import base64
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock
 
 import frappe
 import pytest
@@ -46,81 +46,69 @@ def test_doc_preview_content(monkeypatch, ext):
 	assert content is not None
 
 
+def _fake_libreoffice(calls):
+	"""subprocess.run stand-in: records the command and writes a PDF where LibreOffice would."""
+
+	def run(cmd, **kwargs):
+		calls.append((cmd, kwargs))
+		outdir = Path(cmd[cmd.index("--outdir") + 1])
+		(outdir / (Path(cmd[-1]).stem + ".pdf")).write_bytes(b"%PDF fake")
+
+	return run
+
+
 @pytest.mark.parametrize("ext", ["ppt", "pptx", "odp", "key"])
-@patch("cloud_storage.cloud_storage.overrides.file.subprocess.run")
-def test_local_presentation_pdf_preview(mock_run, tmp_path, monkeypatch, ext):
-	"""Test local presentation preview converted to pdf"""
-
-	pres_file = tmp_path / f"slides.{ext}"
-	pres_file.write_bytes(b"fake presentation content")
-
-	pdf_file = tmp_path / "slides.pdf"
-	pdf_file.write_bytes(b"%PDF fake")
-
+def test_local_presentation_pdf_preview(monkeypatch, ext):
+	"""Local presentation is converted in an isolated temp dir that is removed afterwards"""
+	calls = []
+	monkeypatch.setattr("cloud_storage.cloud_storage.overrides.file.subprocess.run", _fake_libreoffice(calls))
 	doc = _create_file_doc(f"slides.{ext}")
-	doc.is_private = 0
+	monkeypatch.setattr(CloudStorageFile, "get_content", lambda self, encodings=None: b"fake presentation")
 
-	monkeypatch.setattr(
-		"frappe.get_site_path",
-		lambda *args: str(pres_file),
-	)
+	result = doc.get_pdf_preview()
 
-	mock_run.return_value = None
-
-	with patch(
-		"cloud_storage.cloud_storage.overrides.file.Path.with_suffix",
-		return_value=pdf_file,
-	):
-		with patch("builtins.open", lambda *args, **kwargs: pdf_file.open("rb")):
-			result = doc.get_pdf_preview()
-
-	decoded = base64.b64decode(result)
-
-	assert decoded.startswith(b"%PDF")
+	assert base64.b64decode(result).startswith(b"%PDF")
+	cmd, kwargs = calls[0]
+	assert cmd[:2] == ["timeout", "-k"] and "--headless" in cmd and kwargs["timeout"] > 0
+	assert any(arg.startswith("-env:UserInstallation=") for arg in cmd)
+	assert not Path(cmd[-1]).parent.exists()  # temp dir cleaned up
 
 
 @pytest.mark.parametrize("ext", ["ppt", "pptx", "odp", "key"])
-@patch("cloud_storage.cloud_storage.overrides.file.subprocess.run")
-def test_s3_presentation_preview(mock_run, tmp_path, ext):
-	"""Test preview when file comes from S3"""
-
+def test_s3_presentation_preview(monkeypatch, ext):
+	"""Preview of a file stored in S3 converts the object's bytes"""
 	pres_content = b"presentation binary"
 	client = get_cloud_storage_client()
+	client.put_object(Bucket=client.bucket, Key=f"slides.{ext}", Body=pres_content)
 
-	client.put_object(
-		Bucket=client.bucket,
-		Key=f"slides.{ext}",
-		Body=pres_content,
-	)
+	seen = []
 
-	pdf_file = tmp_path / "slides.pdf"
-	pdf_file.write_bytes(b"%PDF mock")
+	def run(cmd, **kwargs):
+		seen.append(Path(cmd[-1]).read_bytes())
+		_fake_libreoffice([])(cmd, **kwargs)
 
-	doc = _create_file_doc(
-		f"slides.{ext}",
-		file_url=f"/api/method/retrieve?key=slides.{ext}",
-	)
-
+	monkeypatch.setattr("cloud_storage.cloud_storage.overrides.file.subprocess.run", run)
+	doc = _create_file_doc(f"slides.{ext}", file_url=f"/api/method/retrieve?key=slides.{ext}")
 	doc.s3_key = f"slides.{ext}"
 
-	mock_run.return_value = None
-	real_open = open
+	result = doc.get_pdf_preview()
 
-	def open_for_pdf(path, *args, **kwargs):
-		if str(path).endswith(".pdf"):
-			return pdf_file.open("rb")
-		return real_open(path, *args, **kwargs)
+	assert base64.b64decode(result).startswith(b"%PDF")
+	assert seen == [pres_content]
 
-	with patch(
-		"cloud_storage.cloud_storage.overrides.file.Path.with_suffix",
-		return_value=pdf_file,
-	):
-		with patch("builtins.open", open_for_pdf):
-			result = doc.get_pdf_preview()
 
-	decoded = base64.b64decode(result)
+def test_preview_conversion_failure_is_reported(monkeypatch):
+	import subprocess
 
-	assert decoded.startswith(b"%PDF")
+	def run(cmd, **kwargs):
+		raise subprocess.CalledProcessError(124, cmd, stderr=b"timed out")
+
+	monkeypatch.setattr("cloud_storage.cloud_storage.overrides.file.subprocess.run", run)
+	doc = _create_file_doc("slides.pptx")
+	monkeypatch.setattr(CloudStorageFile, "get_content", lambda self, encodings=None: b"x")
+
+	with pytest.raises(frappe.ValidationError):
+		doc.get_pdf_preview()
 
 
 def test_preview_folder_error():

@@ -51,7 +51,7 @@ frappe.ui.form.on('File', {
 	},
 
 	preview_doc_content: async function (frm) {
-		const response = await frm.call('get_content')
+		const response = await frm.call('get_preview_content')
 		let file_content = response.message
 		if (file_content) {
 			const field = frm.get_field('preview_html')

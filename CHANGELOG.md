@@ -3,6 +3,38 @@ For license information, please see license.txt-->
 
 # CHANGELOG
 
+## v16.2.0 (2026-11-09)
+
+Production hardening for DigitalOcean Spaces, verified against a live Space (upload path, Repost Item Valuation end-to-end, real HTTP flows) and ERPNext v16.
+
+### Added
+
+- **Local read cache for cloud files:** `File.get_full_path()` returns a local copy of a cloud object, so Frappe/ERPNext code that opens files by path (Chart of Accounts Importer, xlsx readers, File *Unzip*, Import Supplier Invoice, Transaction Deletion Record, bank connector keys) works with cloud storage. Copies are downloaded atomically, re-downloaded if damaged, kept outside served/backed-up folders (`private/cloud_storage_cache`, mode `0600`) and removed by a new hourly `prune_local_cache` job after `cache_ttl_hours` (default 24) unused.
+- **Local-only attachments:** files that other apps rewrite in place stay on local disk: Data Import, Bank Statement Import, Repost Item Valuation checkpoint (`reposting_data_file`), and india_banking_connector's H2H Payment Log / H2H Status Log / CITI H2H Connector. Extendable per site with `cloud_storage_settings.local_only_attachments`.
+- `get_preview_content` (read-permission checked) for the in-browser DOCX preview.
+- New optional `cloud_storage_settings` keys: `max_attempts`, `connect_timeout`, `read_timeout`, `max_pool_connections`, `cache_ttl_hours`, `preview_timeout`, `local_only_attachments`.
+
+### Changed
+
+- S3 client is reused per worker process and settings (uploads ~2.5x faster), with standard-mode retries, connect/read timeouts and `request_checksum_calculation="when_required"` (no `aws-chunked` bodies, independent of the boto3 version).
+- Uploads send `Content-MD5` (the server rejects corrupted bodies), upload the processed bytes (EXIF stripping honoured) and only point the File at the object once it exists; failures show a clear message, are logged and leave no File record.
+- `get_content()` now matches core's contract, including `encodings` (fixes `TypeError` in Repost Item Valuation, EDI Code List and india_compliance GST Return Log) and core's decoding of cloud files. It is no longer callable over HTTP, as in core.
+- With cloud storage on, core's content-hash dedup is skipped, so a file with the same content as a local file is still uploaded.
+- PDF previews run LibreOffice in an isolated temp dir and profile with a hard `preview_timeout` (default 120s); nothing is left in `/tmp`.
+- `on_trash` follows core: protected-file check, "Attachment Removed" timeline entry, and the local file is deleted only after commit.
+
+### Fixed
+
+- **Security:** a user could create a File carrying another user's `s3_key` and download that private object. Keys can now only be reused from Files the user can read, and an object shared by a private record always requires permission on a private record.
+- **Security:** server-side request forgery through `get_content` on web-link files (internal URLs were fetched and returned).
+- **Security:** any user could reset another user's sharing link (now requires write permission); `write_file`, `delete_file` and `get_cloud_storage_client` are no longer exposed as API methods; `remove_attach` only detaches from a document the file is attached to and no longer commits mid-request.
+- Non-admin users got `DocType None not found` when deleting an unattached file.
+- "Only System Managers can upload public files" and attachment write-permission checks now apply to cloud uploads.
+- `share` returns 404 for an unknown key instead of an inconsistent response.
+
+### Notes
+- Deleting a File still keeps its object in the bucket (retention-only, unchanged).
+
 ## v16.1.0 (2026-09-16)
 
 Digidyke fork — hardened for ERPNext / Frappe v16 on DigitalOcean Spaces (S3-compatible object storage).

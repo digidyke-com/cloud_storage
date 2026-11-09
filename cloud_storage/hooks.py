@@ -114,6 +114,10 @@ override_doctype_class = {"File": "cloud_storage.cloud_storage.overrides.file.Cl
 # Scheduled Tasks
 # ---------------
 
+scheduler_events = {
+	"hourly": ["cloud_storage.cloud_storage.overrides.file.prune_local_cache"],
+}
+
 # scheduler_events = {
 # 	"all": [
 # 		"cloud_storage.tasks.all"
